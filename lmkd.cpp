@@ -57,6 +57,7 @@
 #include <psi/psi.h>
 
 #include "reaper.h"
+#include "slmk.h"
 #include "statslog.h"
 #include "watchdog.h"
 
@@ -252,7 +253,10 @@ static uint64_t mp_event_count;
 
 static android_log_context ctx;
 static Reaper reaper;
+static SimpleLmk slmk;
+static bool slmk_enabled;
 static int reaper_comm_fd[2];
+static int slmk_comm_fd[2];
 
 enum polling_update {
     POLLING_DO_NOT_CHANGE,
@@ -2390,6 +2394,19 @@ static void kill_fail_handler(int data __unused, uint32_t events __unused,
     poll_params->update = POLLING_RESUME;
 }
 
+static void kill_slmk_fail_handler(int data __unused, uint32_t events __unused,
+                              struct polling_params *poll_params) {
+    int pid;
+
+    // Extract pid from the communication pipe. Clearing the pipe this way allows further
+    // epoll_wait calls to sleep until the next event.
+    if (TEMP_FAILURE_RETRY(read(slmk_comm_fd[0], &pid, sizeof(pid))) != sizeof(pid)) {
+        ALOGE("thread communication read failed: %s", strerror(errno));
+    }
+    stop_wait_for_proc_kill(false);
+    poll_params->update = POLLING_RESUME;
+}
+
 static void start_wait_for_proc_kill(int pid_or_fd) {
     static struct event_handler_info kill_done_hinfo = { 0, kill_done_handler };
     struct epoll_event epev;
@@ -2435,6 +2452,10 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     int64_t swap_kb;
     char buf[pagesize];
     char desc[LINE_MAX];
+    
+    if (slmk_enabled) {
+        goto out;
+    }
 
     if (!procp->valid || !read_proc_status(pid, buf, sizeof(buf))) {
         goto out;
@@ -2542,6 +2563,8 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
     int i;
     int killed_size = 0;
     bool choose_heaviest_task = kill_heaviest_task;
+    
+    if (slmk_enabled) return 0;
 
     for (i = OOM_SCORE_ADJ_MAX; i >= min_score_adj; i--) {
         struct proc *procp;
@@ -2712,6 +2735,10 @@ union psi_event_data {
 
 static void __mp_event_psi(enum event_source source, union psi_event_data data,
                            uint32_t events, struct polling_params *poll_params) {
+    if (slmk_enabled) {
+        ALOGD("SLMK: skipping psi events!");
+        return;
+    }
     enum reclaim_state {
         NO_RECLAIM = 0,
         KSWAPD_RECLAIM,
@@ -3732,6 +3759,11 @@ static void drop_reaper_comm() {
     close(reaper_comm_fd[1]);
 }
 
+static void drop_slmk_comm() {
+    close(slmk_comm_fd[0]);
+    close(slmk_comm_fd[1]);
+}
+
 static bool setup_reaper_comm() {
     if (pipe(reaper_comm_fd)) {
         ALOGE("pipe failed: %s", strerror(errno));
@@ -4054,6 +4086,10 @@ static void mainloop(void) {
 }
 
 int issue_reinit() {
+    if (slmk_enabled) {
+        ALOGI("SLMK: ignoring og lmkd reinit");
+        return 0;
+    }
     int sock;
 
     sock = lmkd_connect();
@@ -4184,6 +4220,62 @@ static bool update_props() {
     return true;
 }
 
+static bool setup_slmk_comm() {
+    if (pipe(slmk_comm_fd)) {
+        ALOGE("pipe failed: %s", strerror(errno));
+        return false;
+    }
+
+    int flags = fcntl(slmk_comm_fd[0], F_GETFL);
+    if (fcntl(slmk_comm_fd[0], F_SETFL, flags | O_NONBLOCK)) {
+        ALOGE("fcntl failed: %s", strerror(errno));
+        drop_slmk_comm();
+        return false;
+    }
+
+    return true;
+}
+
+static void hookSimpleLmk() {
+    ALOGI("SLMK: hooking slmk");
+
+    slmk_enabled = GET_LMK_PROPERTY(bool, "use_simple_lmk", false);
+    ALOGI("SLMK: slmk_enabled = %s", slmk_enabled ? "true" : "false");
+    
+    if (!slmk_enabled) return;
+
+    slmk.set_reaper(&reaper);
+
+    if (!setup_slmk_comm()) {
+        ALOGE("Failed to create thread communication channel");
+        return;
+    }
+
+    // Setup epoll handler
+    struct epoll_event epev;
+    static struct event_handler_info kill_failed_hinfo = { 0, kill_slmk_fail_handler };
+    epev.events = EPOLLIN;
+    epev.data.ptr = (void *)&kill_failed_hinfo;
+    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, slmk_comm_fd[0], &epev)) {
+        ALOGE("epoll_ctl failed: %s", strerror(errno));
+        drop_slmk_comm();
+        return;
+    }
+
+    if (!slmk.init(slmk_comm_fd[1])) {
+        ALOGE("Failed to initialize slmk object");
+        if (epoll_ctl(epollfd, EPOLL_CTL_DEL, slmk_comm_fd[0], &epev)) {
+            ALOGE("epoll_ctl failed: %s", strerror(errno));
+        }
+        drop_slmk_comm();
+        return;
+    }
+
+    maxevents++;
+
+    ALOGI("SLMK %s", slmk_enabled ? "enabled" : "disabled");
+}
+
 int main(int argc, char **argv) {
     if ((argc > 1) && argv[1]) {
         if (!strcmp(argv[1], "--reinit")) {
@@ -4204,6 +4296,7 @@ int main(int argc, char **argv) {
     ctx = create_android_logger(KILLINFO_LOG_TAG);
 
     if (!init()) {
+    
         if (!use_inkernel_interface) {
             /*
              * MCL_ONFAULT pins pages as they fault instead of loading
@@ -4238,10 +4331,11 @@ int main(int argc, char **argv) {
         if (!watchdog.init()) {
             ALOGE("Failed to initialize the watchdog");
         }
-
+        
+        hookSimpleLmk();
         mainloop();
     }
-
+    
     android_log_destroy(&ctx);
 
     ALOGI("exiting");
