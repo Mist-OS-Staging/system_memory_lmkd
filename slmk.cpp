@@ -33,6 +33,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ax_process_utils.h"
+
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -565,41 +567,14 @@ void* slmk_main(void* param) {
     pid_t tid = gettid();
     
     struct sched_param slmk_param = { 
-        .sched_priority = 98 
+        .sched_priority = 99 
     };
 
     if (!SetTaskProfiles(tid, {"CPUSET_SP_TOP_APP"}, true)) {
         ALOGE("SLMK: Failed to assign cpuset to thread");
     }
 
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
- 
-    std::vector<int32_t> big_cores;
- 
-    auto parseCpusets = [](const std::string& cpuset_str, 
-                          std::vector<int32_t>& cpus) {
-        std::istringstream ss(cpuset_str);
-        std::string token;
-        while (std::getline(ss, token, ',')) {
-            char* endptr;
-            long cpu = std::strtol(token.c_str(), &endptr, 10);
-            if (*endptr == '\0' && cpu >= 0) {
-                cpus.push_back(static_cast<int32_t>(cpu));
-            } else {
-                ALOGW("SLMK: Invalid CPU core value: %s", token.c_str());
-            }
-        }
-    };
- 
-    parseCpusets(android::base::GetProperty("persist.sys.axion_cpu_big", 
-                                           "4,5,6,7"), big_cores);
- 
-    for (int core : big_cores) {
-        CPU_SET(core, &cpuset);
-    }
- 
-    if (sched_setaffinity(tid, sizeof(cpu_set_t), &cpuset) != 0) {
+    if (axion::process::SetThreadAffinity(tid, 0)) {
         ALOGW("SLMK: Failed to set thread CPU affinity to big cores");
     } else {
         ALOGI("SLMK: Successfully set thread CPU affinity to big cores");
